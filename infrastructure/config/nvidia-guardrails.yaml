@@ -1,0 +1,27 @@
+models:
+  - type: main
+    engine: openai
+    model: gpt-4-2025
+
+rails:
+  input:
+    - flow: check_input_safety
+      uses: regex
+      pattern: "(?i)(malicious|exploit|sql injection)"
+      action: deny
+
+  output:
+    - flow: validate_response
+      uses: fact_check
+      params:
+        api_key: ${FACT_CHECK_API_KEY}
+        max_claims: 5
+        
+    - flow: filter_pii
+      uses: regex_substitution
+      pattern: "\\b\\d{3}-\\d{2}-\\d{4}\\b"
+      replacement: "[REDACTED]"
+
+logging:
+  level: INFO
+  format: json

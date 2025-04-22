@@ -1,0 +1,28 @@
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: retriever-agent-mtls
+spec:
+  selector:
+    matchLabels:
+      app: retriever-agent
+  mtls:
+    mode: STRICT
+
+---
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: retriever-agent-authz
+spec:
+  selector:
+    matchLabels:
+      app: retriever-agent
+  rules:
+  - from:
+    - source:
+        principals: ["cluster.local/ns/rag-system/sa/intent-recognizer"]
+    to:
+    - operation:
+        methods: ["GET"]
+        paths: ["/retrieve"]

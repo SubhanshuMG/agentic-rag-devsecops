@@ -1,0 +1,213 @@
+name: Agentic RAG DevSecOps Pipeline
+
+on:
+#   push:
+#     branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-west-2
+  EKS_CLUSTER: agentic-rag-cluster
+  VAULT_ADDR: https://vault.agentic-rag.internal
+  OPA_URL: http://opa.policy-system:8181
+
+jobs:
+  pre-flight:
+    name: Pre-Commit Security
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Detect Secrets
+      uses: awslabs/git-secrets@master
+      with:
+        command: scan -r .
+
+    - name: SAST Scan
+      uses: returntocorp/semgrep-action@v1
+      with:
+        config: p/ci
+
+    - name: Upload SAST Results
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: semgrep-results.sarif
+
+  build-and-scan:
+    name: Build & Security Scan
+    needs: pre-flight
+    runs-on: [ self-hosted, secure-builder ]
+    strategy:
+      matrix:
+        component: [ 'retriever-agent', 'intent-recognizer', 'policy-enforcement' ]
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Setup Buildx
+      uses: docker/setup-buildx-action@v2
+
+    - name: Build Container
+      uses: docker/build-push-action@v4
+      with:
+        context: ./docker/${{ matrix.component }}
+        tags: ${{ matrix.component }}:latest
+        sbom: true
+        provenance: true
+        secrets: |
+          "VAULT_TOKEN=${{ secrets.VAULT_TOKEN }}"
+
+    - name: Generate SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: ${{ matrix.component }}:latest
+        format: cyclonedx
+        output-file: sbom-${{ matrix.component }}.cdx
+
+    - name: Container Scan
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ matrix.component }}:latest
+        format: sarif
+        output: trivy-${{ matrix.component }}.sarif
+        severity: CRITICAL,HIGH
+        ignore-unfixed: true
+
+    - name: Install Cosign
+      uses: sigstore/cosign-installer@main
+      with:
+        cosign-release: v2.2.0
+
+    - name: Sign Container
+      run: cosign sign --key vault://agentic-rag/signing-keys ${{ matrix.component }}:latest
+
+  infrastructure:
+    name: Infrastructure Deployment
+    needs: build-and-scan
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    - name: Terraform Init
+      uses: hashicorp/terraform-github-actions@v2
+      with:
+        tf_actions_version: 1.6.0
+        tf_actions_subcommand: init
+        tf_actions_working_dir: infra/terraform
+
+    - name: Terraform Plan
+      id: plan
+      uses: hashicorp/terraform-github-actions@v2
+      with:
+        tf_actions_subcommand: plan
+        tf_actions_working_dir: infra/terraform
+        tf_actions_args: -var-file=prod.tfvars
+
+    - name: OPA Policy Check
+      uses: open-policy-agent/conftest-action@v3
+      with:
+        policy: policies/opa/
+        file: infra/terraform/*.tf
+
+    - name: Terraform Apply
+      if: github.ref == 'refs/heads/main'
+      uses: hashicorp/terraform-github-actions@v2
+      with:
+        tf_actions_subcommand: apply
+        tf_actions_working_dir: infra/terraform
+        tf_actions_args: -auto-approve
+
+  deploy-agents:
+    name: Deploy Agents
+    needs: [ infrastructure, build-and-scan ]
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Deploy to EKS
+      uses: kodermax/kubectl-aws-eks@v1
+      with:
+        cluster_name: ${{ env.EKS_CLUSTER }}
+        command: |
+          kubectl apply -k infra/kubernetes/overlays/production
+          kubectl rollout status deployment/retriever-agent --timeout=300s
+
+    - name: Inject Secrets
+      uses: hashicorp/vault-action@v2
+      with:
+        url: ${{ env.VAULT_ADDR }}
+        token: ${{ secrets.VAULT_TOKEN }}
+        secrets: |
+          secret/data/agentic-rag/database | DB_CREDS ;
+          secret/data/agentic-rag/tls | TLS_CERT
+
+    - name: Service Mesh Configuration
+      run: |
+        istioctl install -y --set profile=default \
+          --set values.global.mtls.enabled=true \
+          --set values.global.sds.enabled=true
+
+  post-deploy:
+    name: Post-Deploy Validation
+    needs: deploy-agents
+    runs-on: ubuntu-latest
+    steps:
+    - name: Run Smoke Tests
+      uses: nick-invision/retry@v2
+      with:
+        command: |
+          kubectl exec -it deploy/retriever-agent -- \
+            curl -sS --cacert /etc/ssl/certs/ca.pem https://localhost:8000/health
+
+    - name: DAST Scan
+      uses: zaproxy/action-full-scan@v0
+      with:
+        target: 'https://retriever-agent.agentic-rag.internal'
+        rules_file_name: dast-scan-rules.yaml
+
+    - name: Runtime Security Scan
+      uses: falcosecurity/falco-actions-runtime-scan@main
+      with:
+        falco_outputs: file,stdout
+        rules_file: security/falco-rules.yaml
+
+    - name: Chaos Testing
+      uses: chaos-mesh/chaos-mesh-action@v1
+      with:
+        action: pod-failure
+        target: retriever-agent
+        duration: 5m
+
+  monitoring:
+    name: Observability Setup
+    needs: deploy-agents
+    runs-on: ubuntu-latest
+    steps:
+    - name: Deploy Monitoring Stack
+      uses: helm/helm-action@v1
+      with:
+        command: upgrade --install
+        chart: prometheus-community/kube-prometheus-stack
+        values: observability/values.yaml
+
+    - name: Configure Alerts
+      uses: prometheus/prometheus-ci/action@v1
+      with:
+        config-file: observability/prometheus/alerts.yaml
+
+    - name: Logging Pipeline
+      uses: grafana/grafana-ci/action@v1
+      with:
+        command: apply -f observability/loki/loki-stack.yaml
